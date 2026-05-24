@@ -1,3 +1,14 @@
+---
+title: YouTube Recommendation Lite
+emoji: 🎬
+colorFrom: red
+colorTo: purple  
+sdk: gradio
+sdk_version: 4.7.0
+app_file: hf_app.py
+pinned: false
+---
+
 # RecoStream: YouTube-Scale Real-Time Recommendation System
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
