@@ -5,6 +5,7 @@
 # colorTo: purple  
 # sdk: gradio
 # sdk_version: 4.7.0
+# python_version: 3.10
 # app_file: hf_app.py
 # pinned: false
 # ---
