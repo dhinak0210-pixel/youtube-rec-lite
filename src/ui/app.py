@@ -175,6 +175,30 @@ body, .gradio-container {
 }
 """
 
+# Category → (emoji, grad_start, grad_end, youtube_embed_id)
+_CAT = {
+    "Music":     ("🎵", "#ec4899", "#9333ea", "jNQXAC9IVRw"),
+    "Tech":      ("💻", "#3b82f6", "#6366f1", "Y8Tko2YC5hA"),
+    "Gaming":    ("🎮", "#8b5cf6", "#6d28d9", "dQw4w9WgXcQ"),
+    "Comedy":    ("😂", "#f59e0b", "#ef4444", "6wXkI4Ch_IA"),
+    "Sports":    ("⚽", "#10b981", "#0891b2", "iRzXJMFnqZM"),
+    "DIY":       ("🔨", "#f97316", "#eab308", "tPEE9ZwTmy0"),
+    "Education": ("📚", "#06b6d4", "#3b82f6", "aircAruvnKk"),
+    "Vlogs":     ("📹", "#d946ef", "#ec4899", "kfMoVoipty4"),
+    "Fitness":   ("💪", "#ef4444", "#f97316", "iRzXJMFnqZM"),
+    "Pets":      ("🐾", "#84cc16", "#10b981", "FlsCjmMhFmw"),
+    "Cooking":   ("🍳", "#f97316", "#f59e0b", "1IszT_guI08"),
+    "Travel":    ("✈️", "#06b6d4", "#6366f1", "tMujG-n8i04"),
+    "Finance":   ("💰", "#10b981", "#3b82f6", "PHe0bXAIuk0"),
+    "Science":   ("🔬", "#6366f1", "#8b5cf6", "7lCDEYXw3mM"),
+    "News":      ("📰", "#64748b", "#374151", "Y8Tko2YC5hA"),
+}
+_DEF_CAT = ("🎬", "#6366f1", "#a855f7", "jNQXAC9IVRw")
+
+def _fmt_dur(secs):
+    m, s = divmod(int(secs), 60)
+    return f"{m}:{s:02d}" if m < 60 else f"{m//60}:{m%60:02d}:{s:02d}"
+
 # ==================== TAB 1 FUNCTIONS ====================
 def query_personalized_feed(user_id: int, time_of_day: str, device: str, top_n: int) -> Tuple[str, str, Dict]:
     """
@@ -216,58 +240,65 @@ def query_personalized_feed(user_id: int, time_of_day: str, device: str, top_n: 
         
         if not recs:
             return group_html, "<p style='color:#a1a1aa;'>Empty recommendations pool.</p>", data
-            
-        # Build tabular matrix
-        table_html = """
-        <div style='overflow-x: auto;'>
-            <table style='width: 100%; border-collapse: collapse; margin-top: 10px; color: #fff;'>
-                <thead>
-                    <tr style='border-bottom: 2px solid rgba(255,255,255,0.1); text-align: left;'>
-                        <th style='padding: 12px;'>🏅 Rank</th>
-                        <th style='padding: 12px;'>🎬 Video ID</th>
-                        <th style='padding: 12px;'>📂 Category</th>
-                        <th style='padding: 12px;'>🎯 Score</th>
-                        <th style='padding: 12px;'>🔍 Source</th>
-                        <th style='padding: 12px;'>💡 Why?</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """
-        
-        # Candidate source heuristic tracker
-        source_keys = [k for k, v in sources.items() if v > 0] if sources else ["mmoe"]
-        if not source_keys:
-            source_keys = ["mmoe"]
-            
+
+        uid = str(abs(hash((user_id, time_of_day, top_n))))[-5:]
+        cards = ""
         for idx, r in enumerate(recs):
-            vid = r["video_id"]
-            why_text = explanations.get(str(vid), "High matching user latent preference pattern").replace("\n", "<br>")
-            p_source = source_keys[idx % len(source_keys)].upper()
-            
-            table_html += f"""
-                    <tr style='border-bottom: 1px solid rgba(255,255,255,0.05);'>
-                        <td style='padding: 12px; font-weight: bold; color: #d1d5db;'>#{idx+1}</td>
-                        <td style='padding: 12px; color: #6366f1; font-weight: bold;'>Video #{vid}</td>
-                        <td style='padding: 12px;'><span style='background: rgba(255,255,255,0.06); padding: 3px 8px; border-radius: 4px; font-size: 0.82em;'>{r['category']}</span></td>
-                        <td style='padding: 12px; color: #10b981; font-weight: bold;'>{r['score']:.4f}</td>
-                        <td style='padding: 12px; font-size: 0.8em; letter-spacing: 0.5px; color: #eab308; font-weight: 600;'>✨ {p_source}</td>
-                        <td style='padding: 12px; font-size: 0.88em; color: #e5e7eb;'>{why_text}</td>
-                    </tr>
-            """
-            
-        table_html += """
-                </tbody>
-            </table>
-        </div>
-        """
-        
-        # Store in LRU cache
+            vid   = r["video_id"]
+            cat   = r.get("category", "Tech")
+            score = r.get("score", 0.0)
+            dur   = _fmt_dur(r.get("duration", 180))
+            why   = (explanations.get(str(vid), "Matches your preference profile")
+                     .replace("\n"," ").replace("'",""))[:78]
+            emoji, c1, c2, yt_id = _CAT.get(cat, _DEF_CAT)
+            pct   = min(int(score * 300), 100)
+            cards += f"""
+<div style="background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:14px;overflow:hidden;transition:all .25s ease"
+     onmouseenter="this.style.borderColor='rgba(99,102,241,.45)';this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 28px rgba(0,0,0,.4)'"
+     onmouseleave="this.style.borderColor='rgba(255,255,255,.06)';this.style.transform='';this.style.boxShadow=''">
+  <div onclick="rs_play_{uid}('https://www.youtube.com/embed/{yt_id}','Video #{vid} &bull; {cat}')"
+       style="height:126px;background:linear-gradient(135deg,{c1},{c2});display:flex;align-items:center;justify-content:center;position:relative;cursor:pointer">
+    <span style="font-size:2.4em;filter:drop-shadow(0 2px 6px rgba(0,0,0,.5))">{emoji}</span>
+    <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:0;background:rgba(0,0,0,.38);transition:opacity .18s"
+         onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0'">
+      <span style="font-size:2.2em">▶️</span></div>
+    <span style="position:absolute;bottom:6px;right:8px;background:rgba(0,0,0,.75);color:#fff;padding:2px 6px;font-size:.7em;border-radius:4px;font-weight:700">{dur}</span>
+    <span style="position:absolute;top:7px;left:8px;background:rgba(0,0,0,.65);color:#fff;padding:2px 8px;font-size:.68em;border-radius:4px;font-weight:800">#{idx+1}</span>
+  </div>
+  <div style="padding:11px">
+    <div style="font-weight:700;font-size:.88em;color:#fff;margin-bottom:3px">Video #{vid}</div>
+    <div style="font-size:.72em;color:#a1a1aa;text-transform:uppercase;letter-spacing:.5px;margin-bottom:7px">{cat}</div>
+    <div style="background:rgba(255,255,255,.07);border-radius:3px;height:3px;margin-bottom:8px">
+      <div style="height:100%;width:{pct}%;background:linear-gradient(90deg,{c1},{c2});border-radius:3px"></div></div>
+    <div style="font-size:.72em;color:#6b7280;margin-bottom:9px;line-height:1.35">{why}…</div>
+    <div style="display:flex;gap:7px">
+      <button onclick="rs_play_{uid}('https://www.youtube.com/embed/{yt_id}','Video #{vid} &bull; {cat}')"
+              style="flex:1;background:#e11d48;border:none;color:#fff;font-weight:700;padding:7px;border-radius:8px;cursor:pointer;font-size:.8em"
+              onmouseenter="this.style.background='#be123c'" onmouseleave="this.style.background='#e11d48'">▶ Watch</button>
+      <button style="background:rgba(255,255,255,.08);border:none;color:#fff;padding:7px 10px;border-radius:8px;cursor:pointer;font-size:.8em"
+              onmouseenter="this.style.background='rgba(255,255,255,.18)'" onmouseleave="this.style.background='rgba(255,255,255,.08)'">👍</button>
+    </div>
+  </div>
+</div>"""
+
+        table_html = f"""<div id="rs_{uid}">
+<div id="rs_p_{uid}" style="display:none;background:#000;border-radius:12px;overflow:hidden;margin-bottom:16px;position:relative;aspect-ratio:16/9;max-height:340px">
+  <iframe id="rs_f_{uid}" src="" frameborder="0" allow="autoplay;encrypted-media;picture-in-picture" allowfullscreen style="width:100%;height:100%"></iframe>
+  <button onclick="rs_close_{uid}()" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.2);color:#fff;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:.82em;z-index:10">✕ Close</button>
+  <div id="rs_np_{uid}" style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.6);backdrop-filter:blur(8px);padding:7px 14px;font-size:.8em;color:#fff;font-weight:600;pointer-events:none"></div>
+</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(195px,1fr));gap:13px">{cards}</div>
+</div>
+<script>
+function rs_play_{uid}(url,title){{var f=document.getElementById('rs_f_{uid}'),p=document.getElementById('rs_p_{uid}'),n=document.getElementById('rs_np_{uid}');f.src=url+'?autoplay=1';n.innerHTML='&#9654; '+title;p.style.display='block';p.scrollIntoView({{behavior:'smooth',block:'nearest'}});}}
+function rs_close_{uid}(){{document.getElementById('rs_f_{uid}').src='';document.getElementById('rs_p_{uid}').style.display='none';}}
+</script>"""
+
         if cache_enabled_state[0]:
             ui_lru_cache.put(cache_key, (group_html, table_html, data))
-            
         return group_html, table_html, data
     except Exception as e:
-        return "<h3>❌ API Down</h3>", f"<p style='color:#ef4444;'>Failed to query recommendation gateway: {e}</p>", {"error": str(e)}
+        return "<h3>❌ API Down</h3>", f"<p style='color:#ef4444;'>Failed: {e}</p>", {"error": str(e)}
 
 # ==================== MODEL OPTIMIZATION FUNCTIONS ====================
 def quantize_model_ui(model_name: str) -> Tuple[str, str]:
