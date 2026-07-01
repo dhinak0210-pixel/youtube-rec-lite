@@ -303,6 +303,12 @@ class BERT4RecRecommender:
             
             return list(zip(top_indices.tolist(), top_scores.tolist()))
 
+    def predict_next_items(self, user_history: List[int], top_n: int = 100) -> List[Tuple[int, float]]:
+        """
+        Alias for retrieve_candidates to comply with RecommendationEngine interface.
+        """
+        return self.retrieve_candidates(user_history, top_n)
+
     def get_sequence_embedding(self, history: List[int]) -> np.ndarray:
         """
         Extracts a high-fidelity 128-dimensional embedding representing the user's sequential 
