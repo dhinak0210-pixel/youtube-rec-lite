@@ -357,7 +357,7 @@ def clear_cache_ui() -> str:
 # ==================== TAB 2 FUNCTIONS ====================
 def run_ab_simulation(progress=gr.Progress()) -> Tuple[str, str]:
     """
-    Executes a high-fidelity A/B testing simulation of 5,000 users.
+    Executes a high-fidelity A/B testing simulation of 5,000 users using ABTestingService.
     """
     progress(0.0, desc="Allocating user cohorts...")
     time.sleep(0.4)
@@ -366,26 +366,40 @@ def run_ab_simulation(progress=gr.Progress()) -> Tuple[str, str]:
         progress((i / 5.0), desc=f"Evaluating user conversions: Group {i * 1000}...")
         time.sleep(0.35)
         
-    control_views = 2480
-    control_clicks = 188 # ~7.58% CTR
-    control_avg_watch = 0.412 # 41.2% watch complete
-    control_likes = 37 # 19.6% like rate on clicks
+    from services.ab_testing import ABTestingService
+    service = ABTestingService()
     
-    treatment_views = 2520
-    treatment_clicks = 345 # ~13.69% CTR
-    treatment_avg_watch = 0.638 # 63.8% watch complete
-    treatment_likes = 118 # 34.2% like rate on clicks
+    # Run the dynamic statistical simulation
+    report = service.simulate(
+        exp_id=f"sim_{int(time.time())}",
+        n_users=5000,
+        ctrl_ctr=0.0758,
+        treat_ctr=0.1369,
+        ctrl_completion=0.412,
+        treat_completion=0.638
+    )
     
-    p_ctrl = control_clicks / control_views
-    p_treat = treatment_clicks / treatment_views
-    p_pooled = (control_clicks + treatment_clicks) / (control_views + treatment_views)
-    se = (p_pooled * (1 - p_pooled) * (1/control_views + 1/treatment_views)) ** 0.5
-    z_score = (p_treat - p_ctrl) / se
+    control_views = report["control"]["impressions"]
+    control_ctr = report["control"]["ctr"]
+    control_avg_watch = report["control"]["completion_rate"]
+    control_like_rate = report["control"]["like_rate"]
     
-    # Statistical significance calculations
-    p_value = 2.4e-10 # Extremely highly significant
-    significant = "Yes (p < 0.05) ✅"
-    recommendation = "Deploy MMoE Multi-Objective Ranking & GraphSAGE to 100% Production! 🚀"
+    treatment_views = report["treatment"]["impressions"]
+    treatment_ctr = report["treatment"]["ctr"]
+    treatment_avg_watch = report["treatment"]["completion_rate"]
+    treatment_like_rate = report["treatment"]["like_rate"]
+    
+    ctr_test = report["ctr_test"]
+    z_score = ctr_test["z_stat"]
+    p_value = ctr_test["p_value"]
+    significant = "Yes (p < 0.05) ✅" if ctr_test["significant"] else "No ❌"
+    
+    if ctr_test["verdict"] == "SHIP treatment":
+        recommendation = "Deploy MMoE Multi-Objective Ranking & GraphSAGE to 100% Production! 🚀"
+    elif ctr_test["verdict"] == "KEEP control":
+        recommendation = "Retain Control (treatment performed worse)."
+    else:
+        recommendation = "Continue experiment (uplift not statistically significant)."
     
     # Generate Matplotlib chart
     import matplotlib.pyplot as plt
@@ -393,8 +407,8 @@ def run_ab_simulation(progress=gr.Progress()) -> Tuple[str, str]:
     ax.set_facecolor('#121218')
     
     metrics = ['CTR', 'Avg Watch Complete', 'Like Rate']
-    ctrl_vals = [p_ctrl * 100, control_avg_watch * 100, (control_likes / control_clicks) * 100]
-    treat_vals = [p_treat * 100, treatment_avg_watch * 100, (treatment_likes / treatment_clicks) * 100]
+    ctrl_vals = [control_ctr * 100, control_avg_watch * 100, control_like_rate * 100]
+    treat_vals = [treatment_ctr * 100, treatment_avg_watch * 100, treatment_like_rate * 100]
     
     x = np.arange(len(metrics))
     width = 0.35
@@ -412,10 +426,6 @@ def run_ab_simulation(progress=gr.Progress()) -> Tuple[str, str]:
         spine.set_color('#2a2a35')
         
     plt.tight_layout()
-    chart_path = "/home/dhina/recommantation systeam/logs/ab_dashboard_simulation.png"
-    os.makedirs(os.path.dirname(chart_path), exist_ok=True)
-    plt.savefig(chart_path, dpi=300, facecolor=fig.get_facecolor(), edgecolor='none')
-    plt.close()
     
     stats_html = f"""
     <div style='background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); padding: 15px; border-radius: 12px;'>
@@ -424,6 +434,10 @@ def run_ab_simulation(progress=gr.Progress()) -> Tuple[str, str]:
             <tr style='border-bottom: 2px solid rgba(255,255,255,0.1);'>
                 <th style='padding: 8px; text-align: left;'>Statistical Metric</th>
                 <th style='padding: 8px; text-align: left;'>Calculated Value</th>
+            </tr>
+            <tr style='border-bottom: 1px solid rgba(255,255,255,0.05);'>
+                <td style='padding: 8px;'>Cohort Allocation</td>
+                <td style='padding: 8px; color: #a1a1aa;'>Ctrl: {control_views} / Treat: {treatment_views}</td>
             </tr>
             <tr style='border-bottom: 1px solid rgba(255,255,255,0.05);'>
                 <td style='padding: 8px;'>Z-Statistic</td>
@@ -445,7 +459,7 @@ def run_ab_simulation(progress=gr.Progress()) -> Tuple[str, str]:
     </div>
     """
     
-    return chart_path, stats_html
+    return fig, stats_html
 
 # ==================== TAB 3 FUNCTIONS ====================
 def compare_models(selected_models: List[str]) -> Tuple[str, str]:
@@ -487,9 +501,6 @@ def compare_models(selected_models: List[str]) -> Tuple[str, str]:
         spine.set_color('#2a2a35')
         
     plt.tight_layout()
-    chart_path = "/home/dhina/recommantation systeam/logs/model_comparisons_eval.png"
-    plt.savefig(chart_path, dpi=300, facecolor=fig.get_facecolor(), edgecolor='none')
-    plt.close()
     
     # HTML details table
     table_html = """
@@ -518,7 +529,7 @@ def compare_models(selected_models: List[str]) -> Tuple[str, str]:
         """
     table_html += "</tbody></table>"
     
-    return chart_path, table_html
+    return fig, table_html
 
 # ==================== TAB 4 FUNCTIONS ====================
 def stream_refresh_stats(user_id: int) -> Tuple[str, str, str]:
@@ -705,7 +716,7 @@ with gr.Blocks(title="YouTube Recommendation Lite 🎬") as demo:
             with gr.Row():
                 with gr.Column(scale=2, variant="panel"):
                     btn_ab = gr.Button("⚡ Run A/B Test Simulation (5000 users)", variant="primary")
-                    ab_chart = gr.Image(label="Metrics Comparison Chart")
+                    ab_chart = gr.Plot(label="Metrics Comparison Chart")
                     
                 with gr.Column(scale=1, variant="panel"):
                     ab_stats = gr.HTML("<div style='color:#a1a1aa; padding:40px; text-align:center;'>Trigger simulation to view statistical properties.</div>")
@@ -720,7 +731,7 @@ with gr.Blocks(title="YouTube Recommendation Lite 🎬") as demo:
                     btn_compare = gr.Button("🔮 Compare Models", variant="primary")
                     
                 with gr.Column(scale=2, variant="panel"):
-                    compare_chart = gr.Image(label="Evaluation Metrics Comparison Graph")
+                    compare_chart = gr.Plot(label="Evaluation Metrics Comparison Graph")
                     compare_table = gr.HTML("<div style='color:#a1a1aa; padding:20px; text-align:center;'>Run comparison matrix.</div>")
                     
         # TAB 4: Real-Time Streaming Demo

@@ -16,8 +16,15 @@ import scipy.stats as stats
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any
-from loguru import logger
-from config import settings
+import logging
+logger = logging.getLogger(__name__)
+
+# Inline fallback settings (replaces stale config.settings import)
+class _Settings:
+    ab_min_samples: int = 100
+    ab_significance_level: float = 0.05
+    random_seed: int = 42
+settings = _Settings()
 
 # ==========================================
 # 🚀 Modern A/B Testing Service Components
