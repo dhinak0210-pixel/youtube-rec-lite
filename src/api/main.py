@@ -92,49 +92,87 @@ def startup_event():
     else:
         users_df, videos_df, interactions_df = load_data()
     
-    # 2. Fit Preprocessing Pipes
-    preprocessor = RecommenderPreprocessor()
-    preprocessor.fit(users_df, videos_df)
+    # 2. Check and Load Checkpoint
+    from src.models.checkpoint_manager import load_checkpoint, save_checkpoint
+    from src.config import MODEL_CHECKPOINTS_DIR
     
-    # 3. Train Retrieval Models
-    # A. Collaborative Filtering
-    model_cf = CollaborativeFilteringRecommender(kind="item", k=15)
-    model_cf.fit(interactions_df)
-    
-    # B. Matrix Factorization (ALS)
-    model_als = ALSMatrixFactorization(epochs=10)
-    model_als.fit(interactions_df)
-    
-    # C. BERT4Rec Sequential
-    X_bert, y_bert = preprocessor.build_sequential_data(interactions_df)
-    vocab_size = len(preprocessor.video_to_idx)
-    model_bert = BERT4RecRecommender(vocab_size=vocab_size, epochs=5)
-    model_bert.train_model(X_bert, y_bert)
-    
-    # D. Graph Neural Network (GNN)
-    edge_index, v_nodes = preprocessor.build_graph_adjacency(interactions_df)
-    num_nodes = len(preprocessor.user_to_idx) + len(preprocessor.video_to_idx)
-    model_gnn = GNNRecommender(num_nodes=num_nodes, num_videos=len(preprocessor.video_to_idx), epochs=5)
-    model_gnn.train_model(edge_index, v_nodes)
-    
-    # 4. Train Ranking Model (MMoE)
-    X_meta, v_meta = preprocessor.transform_metadata(users_df, videos_df)
-    X_rank, y_click, y_watch = preprocessor.build_ranking_features(interactions_df, X_meta, v_meta)
-    
-    input_dim = X_rank.shape[1] # Feature dim size
-    model_mmoe = MMoERankingEngine(input_dim=input_dim, epochs=5)
-    model_mmoe.train_model(X_rank, y_click, y_watch)
-    
-    # 5. Core Modules Setup
-    cold_start_handler = ColdStartHandler(users_df, videos_df)
-    cold_start_handler.fit(interactions_df)
-    
+    checkpoint = load_checkpoint(MODEL_CHECKPOINTS_DIR)
+    if checkpoint is not None:
+        preprocessor = checkpoint["preprocessor"]
+        model_cf = checkpoint["model_cf"]
+        model_als = checkpoint["model_als"]
+        model_bert = checkpoint["model_bert"]
+        model_gnn = checkpoint["model_gnn"]
+        model_mmoe = checkpoint["model_mmoe"]
+        cold_start_handler = checkpoint["cold_start_handler"]
+        social_graph = checkpoint["social_graph"]
+        logger.info("Loaded recommendation models from checkpoint.")
+    else:
+        # 3. Fit Preprocessing Pipes
+        preprocessor = RecommenderPreprocessor()
+        preprocessor.fit(users_df, videos_df)
+        
+        # 4. Train Retrieval Models
+        # A. Collaborative Filtering
+        model_cf = CollaborativeFilteringRecommender(kind="item", k=15)
+        model_cf.fit(interactions_df)
+        
+        # B. Matrix Factorization (ALS)
+        model_als = ALSMatrixFactorization(epochs=10)
+        model_als.fit(interactions_df)
+        
+        # C. BERT4Rec Sequential
+        X_bert, y_bert = preprocessor.build_sequential_data(interactions_df)
+        vocab_size = len(preprocessor.video_to_idx)
+        model_bert = BERT4RecRecommender(vocab_size=vocab_size, epochs=5)
+        model_bert.train_model(X_bert, y_bert)
+        
+        # D. Graph Neural Network (GNN)
+        edge_index, v_nodes = preprocessor.build_graph_adjacency(interactions_df)
+        num_nodes = len(preprocessor.user_to_idx) + len(preprocessor.video_to_idx)
+        model_gnn = GNNRecommender(num_nodes=num_nodes, num_videos=len(preprocessor.video_to_idx), epochs=5)
+        model_gnn.train_model(edge_index, v_nodes)
+        
+        # 5. Train Ranking Model (MMoE)
+        X_meta, v_meta = preprocessor.transform_metadata(users_df, videos_df)
+        X_rank, y_click, y_watch = preprocessor.build_ranking_features(interactions_df, X_meta, v_meta)
+        
+        input_dim = X_rank.shape[1] # Feature dim size
+        model_mmoe = MMoERankingEngine(input_dim=input_dim, epochs=5)
+        model_mmoe.train_model(X_rank, y_click, y_watch)
+        
+        # 6. Cold Start Handler Setup
+        cold_start_handler = ColdStartHandler(users_df, videos_df)
+        cold_start_handler.fit(interactions_df)
+        
+        # 7. GNN Social Graph Setup (follows generated from power-law rank distribution)
+        social_graph = UserItemGraph(num_users=max(NUM_USERS, len(users_df) + 10), num_items=max(NUM_VIDEOS, len(videos_df) + 10))
+        for _, row in interactions_df.iterrows():
+            if row["click"] == 1:
+                social_graph.add_interaction(int(row["user_id"]), int(row["video_id"]))
+        social_graph.generate_synthetic_social_graph(num_connections=500, alpha=1.6)
+        
+        # Save trained weights & pipeline mapping state to disk
+        save_checkpoint(
+            MODEL_CHECKPOINTS_DIR,
+            preprocessor,
+            model_cf,
+            model_als,
+            model_bert,
+            model_gnn,
+            model_mmoe,
+            cold_start_handler,
+            social_graph
+        )
+        logger.info("Trained and saved recommendation models to checkpoint.")
+
+    # 8. Setup Stateless/Mock Infrastructures
     ab_engine = ABTestEngine()
     metrics_evaluator = ABMetricsEvaluator()
     redis_client = MockRedisClient()
     
-    # 6. High-Throughput Real-Time Event Pipeline Setup (Kafka & Flink)
-    global event_queue, stream_processor, social_graph, recommendation_engine
+    # 9. High-Throughput Real-Time Event Pipeline Setup (Kafka & Flink)
+    global event_queue, stream_processor, recommendation_engine
     event_queue = EventQueue(maxlen=100000)
     stream_processor = StreamProcessor(event_queue, redis_client)
     
@@ -145,14 +183,7 @@ def startup_event():
     # Run the stream background daemon thread
     stream_processor.start()
     
-    # 7. GNN Social Graph Setup (follows generated from power-law rank distribution)
-    social_graph = UserItemGraph(num_users=max(NUM_USERS, len(users_df) + 10), num_items=max(NUM_VIDEOS, len(videos_df) + 10))
-    for _, row in interactions_df.iterrows():
-        if row["click"] == 1:
-            social_graph.add_interaction(int(row["user_id"]), int(row["video_id"]))
-    social_graph.generate_synthetic_social_graph(num_connections=500, alpha=1.6)
-    
-    # 8. Main Recommendation Orchestrator Setup
+    # 10. Main Recommendation Orchestrator Setup
     engine_config = {
         "cf_model": model_cf,
         "als_model": model_als,
