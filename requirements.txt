@@ -16,6 +16,7 @@ fakeredis>=2.17.0
 
 # UI / Demo
 gradio>=4.44.0
+huggingface_hub<0.25
 matplotlib>=3.7.0
 
 # Utilities
