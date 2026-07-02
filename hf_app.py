@@ -323,4 +323,4 @@ with gr.Blocks(title="🎬 YouTube Recommendation Lite", css=CSS) as demo:
             btn_cmp.click(fn=compare_models, inputs=mdl_chk, outputs=[cmp_chart, cmp_tbl])
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
