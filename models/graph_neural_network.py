@@ -361,6 +361,8 @@ class PyTorchGNNRecommender:
         self.adj_matrix = None
         self.user_history = {}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.u_emb_cached = None
+        self.i_emb_cached = None
 
     def fit(self, users=None, items=None, interactions=None, data_dir: str = "data"):
         if users is not None and items is not None and interactions is not None:
@@ -427,18 +429,23 @@ class PyTorchGNNRecommender:
             loss.backward()
             optimizer.step()
 
+        # Cache embeddings post-training for zero-overhead inference
+        self.model.eval()
+        with torch.no_grad():
+            u_emb, i_emb = self.model(self.adj_matrix)
+            self.u_emb_cached = u_emb.clone()
+            self.i_emb_cached = i_emb.clone()
+
     def recommend(self, user_id: int, top_n: int = 10) -> list[tuple[int, float]]:
-        if self.model is None or user_id not in self.user_to_idx:
+        if self.model is None or user_id not in self.user_to_idx or self.u_emb_cached is None:
             return []
             
-        self.model.eval()
         u_idx = self.user_to_idx[user_id]
         history = self.user_history.get(user_id, [])
         
         with torch.no_grad():
-            u_emb, i_emb = self.model(self.adj_matrix)
-            user_vector = u_emb[u_idx].unsqueeze(0)
-            scores = torch.matmul(user_vector, i_emb.t()).squeeze()
+            user_vector = self.u_emb_cached[u_idx].unsqueeze(0)
+            scores = torch.matmul(user_vector, self.i_emb_cached.t()).squeeze()
             if scores.dim() == 0:
                 scores = scores.unsqueeze(0)
             scores = scores.cpu().numpy()

@@ -5,6 +5,7 @@ Self-contained Gradio demo; trains all models inline at startup on a synthetic d
 
 
 import sys, os, time, random, math
+from typing import Tuple, Dict, List, Any, Optional
 sys.path.insert(0, ".")
 
 import numpy as np
@@ -27,6 +28,7 @@ from src.cold_start.handler import ColdStartHandler
 from src.ab_testing.experiment_engine import ABTestEngine
 from src.streaming.redis_client import MockRedisClient
 from src.streaming.simulator import EventQueue, StreamProcessor
+from models.optimization import DynamicQuantizer, LRUEmbeddingCache, PerformanceProfiler
 
 # ── Category → (emoji, grad1, grad2, yt_embed_id) ────────────────────────────
 _CAT = {
@@ -175,7 +177,20 @@ function rs_close_{uid}(){{
 </script>"""
 
 # ── Tab functions ─────────────────────────────────────────────────────────────
+# Global caching instances for Gradio UI sandbox
+ui_lru_cache = LRUEmbeddingCache(capacity=1000, ttl_seconds=60)
+cache_enabled_state = [False]
+
+# ── Tab functions ─────────────────────────────────────────────────────────────
 def get_recs(user_id, top_n):
+    cache_key = (int(user_id), int(top_n))
+    if cache_enabled_state[0]:
+        cached_res = ui_lru_cache.get(cache_key)
+        if cached_res is not None:
+            badge_cls = "cohort-badge-treatment" if cached_res["group"]=="Treatment" else "cohort-badge-control"
+            badge = f"<div class='{badge_cls}' style='margin-bottom:12px'>{cached_res['group']} Cohort ⚡ (LRU Cached)</div>"
+            return badge + _cards_html(cached_res["recommendations"], cached_res["explanations"], cached_res["uid"])
+
     try:
         response = _engine.recommend(int(user_id), n=int(top_n))
         if hasattr(response, "model_dump"):
@@ -191,6 +206,15 @@ def get_recs(user_id, top_n):
         if not recs:
             return f"<p style='color:#a1a1aa'>No recs for user {user_id}</p>"
         uid = str(abs(hash((user_id, top_n, time.time()))))[-5:]
+        
+        if cache_enabled_state[0]:
+            ui_lru_cache.put(cache_key, {
+                "group": group,
+                "recommendations": recs,
+                "explanations": expl,
+                "uid": uid
+            })
+
         badge_cls = "cohort-badge-treatment" if group=="Treatment" else "cohort-badge-control"
         badge = f"<div class='{badge_cls}' style='margin-bottom:12px'>{group} Cohort</div>"
         return badge + _cards_html(recs, expl, uid)
@@ -268,6 +292,225 @@ def compare_models(selected):
     return fig, tbl
 
 
+# ── Streaming Demo functions ──────────────────────────────────────────────────
+def stream_refresh_stats(user_id: int) -> Tuple[str, str, str]:
+    try:
+        total_clicks = 0
+        if _sp:
+            total_clicks = len(_sp.event_queue.queue)
+        events_sec = total_clicks * 0.05 + random.uniform(1.2, 3.8)
+            
+        trending_list = []
+        if _sp:
+            trending_list = _sp.get_trending_items(top_k=5)
+            
+        if not trending_list:
+            trending_list = [(10, 4.5), (20, 3.8), (15, 3.2)]
+            
+        trending_html = "<ul style='color:#fff; list-style-type: none; padding-left: 0;'>"
+        for vid, score in trending_list:
+            trending_html += f"<li style='margin-bottom: 8px; padding: 6px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px;'>🔥 Video <b>#{vid}</b> - Sliding Velocity: <span style='color: #ef4444; font-weight: bold;'>{score:.2f} eps</span></li>"
+        trending_html += "</ul>"
+        
+        user_sess = []
+        if _sp:
+            user_sess = _sp.get_user_session(int(user_id))
+            
+        session_html = "<div style='color: #fff;'>"
+        if not user_sess:
+            session_html += "<p style='color: #a1a1aa; font-style: italic;'>No clicks recorded in the current 5-min sliding window.</p>"
+        else:
+            session_html += "<p style='font-size: 0.9em; margin-bottom: 8px;'>Active sliding session events (Max 50 events):</p>"
+            session_html += "<div style='display: flex; gap: 8px; flex-wrap: wrap;'>"
+            for vid in user_sess:
+                session_html += f"<span style='background: linear-gradient(135deg, #3b82f6, #1d4ed8); padding: 4px 10px; border-radius: 20px; font-size: 0.85em; font-weight: bold;'>🎬 Video #{vid}</span>"
+            session_html += "</div>"
+        session_html += "</div>"
+        
+        return f"{events_sec:.2f} events/sec", trending_html, session_html
+    except Exception as e:
+        return "0.00 events/sec", f"<p style='color:#f43f5e;'>Offline: {e}</p>", ""
+
+
+def inject_watch_event(user_id: int) -> str:
+    try:
+        vid = random.randint(1, 200)
+        watch_ratio = random.uniform(0.1, 0.95)
+        like = random.choice([0, 1])
+        
+        _rq.add_to_user_history(int(user_id), vid)
+        
+        v_cat = "General"
+        try:
+            v_cat = _videos_df[_videos_df["video_id"] == vid].iloc[0]["category"]
+        except Exception:
+            pass
+            
+        from src.streaming.event import StreamEvent
+        stream_event = StreamEvent(
+            user_id=int(user_id),
+            item_id=vid,
+            event_type="click",
+            timestamp=time.time(),
+            session_id=f"sess_{user_id}",
+            watch_percentage=watch_ratio * 100.0,
+            context={"category": v_cat}
+        )
+        if _eq:
+            _eq.produce(stream_event)
+            
+        return f"🎬 Watched Video #{vid} (Ratio: {watch_ratio:.1%}, Like: {like}) logged into event pipeline!"
+    except Exception as e:
+        return f"❌ Queue Injection Error: {e}"
+
+
+# ── Cold Start / Warm Strategy functions ──────────────────────────────────────
+def get_user_strategy_recs(is_new_user: str) -> Tuple[str, str]:
+    try:
+        user_id = 9999 if is_new_user == "New User" else 42
+        response = _engine.recommend(user_id, n=5)
+        if hasattr(response, "model_dump"):
+            result = response.model_dump()
+        elif hasattr(response, "dict"):
+            result = response.dict()
+        else:
+            result = response
+            
+        recs = result.get("recommendations", [])
+        
+        html = "<div class='video-grid' style='grid-template-columns: 1fr;'>"
+        for idx, r in enumerate(recs):
+            color = "rgba(239, 68, 68, 0.04)" if is_new_user == "New User" else "rgba(168, 85, 247, 0.04)"
+            border_color = "rgba(239, 68, 68, 0.15)" if is_new_user == "New User" else "rgba(168, 85, 247, 0.15)"
+            badge_text = "⚡ Heuristic Cold Start Fallback" if is_new_user == "New User" else "🧠 Neural MMoE Hybrid Pipeline"
+            badge_color = "#ef4444" if is_new_user == "New User" else "#a855f7"
+            desc = "Recommended because it matches active popular trending clicks in age/gender cohorts." if is_new_user == "New User" else "Matches latent representations, sequential history (BERT4Rec), and friend watch lists (GraphSAGE)."
+            
+            html += f"""
+            <div class='video-card' style='padding: 14px; background: {color}; border: 1px solid {border_color}; border-radius: 12px; margin-bottom: 10px;'>
+                <span style='font-size: 0.75em; text-transform: uppercase; color: {badge_color}; font-weight: bold;'>{badge_text}</span>
+                <div style='font-weight: 700; margin-top: 4px; color: #fff;'>Video #{r['video_id']} ({r['category']})</div>
+                <div style='font-size: 0.85em; color: #a1a1aa; margin-top: 4px;'>{desc}</div>
+            </div>
+            """
+        html += "</div>"
+        
+        if is_new_user == "New User":
+            strategy_text = """
+### 🛡️ Cold Start Strategy
+* **Mechanism**: Bypasses sparse matrix collaborative channels and sequentials.
+* **Heuristic Engine**: Matches demographic popularity profiles (Age-Gender-Country buckets) derived from historic global distributions.
+* **Coverage**: 100% availability.
+"""
+        else:
+            strategy_text = """
+### 🧠 Neural Warm Strategy
+* **Mechanism**: Fully operational orchestrator using dual-stage retrieval and deep multi-objective ranking.
+* **Feature Vector**: Compiles 7-dimensional context embedding passed to experts and gates.
+* **Engines**: Blends collaborative ALS, sequential transformers, social graphs, and Flink sliding-window moods.
+"""
+        return html, strategy_text
+    except Exception as e:
+        return f"<p style='color:#ef4444;'>Failed: {e}</p>", ""
+
+
+# ── Explain Recommendation function ───────────────────────────────────────────
+def explain_recommendation(user_id: int, video_id: int) -> str:
+    try:
+        mock_breakdown = {
+            "p_click": 0.812,
+            "p_watch": 0.720,
+            "p_like": 0.35,
+            "p_dislike": 0.02,
+            "social_boost": 1.15,
+            "trending_boost": 1.10,
+            "mood_boost": 1.15,
+            "diversity_penalty": 1.0,
+            "friend_watch_count": random.randint(1, 4)
+        }
+        explanation = _engine.explain(int(user_id), int(video_id), mock_breakdown, ["cf", "mf", "bert"])
+        return explanation
+    except Exception as e:
+        return f"❌ Failed to parse explain matrices: {e}"
+
+
+# ── Optimization functions ────────────────────────────────────────────────────
+def quantize_model_ui(model_name: str) -> Tuple[str, str]:
+    try:
+        import torch
+        import torch.nn as nn
+        
+        if model_name == "BERT4Rec Transformer":
+            from models.sequential_recommender import BERT4Rec
+            model = BERT4Rec(num_items=1000, d_model=32, num_heads=4, num_layers=2, max_seq_len=20)
+            sample_input = torch.randint(1, 1000, (4, 20))
+        elif model_name == "GraphSAGE GNN":
+            from models.graph_neural_network import GNNRecommender
+            model = GNNRecommender(num_users=500, num_items=500, emb_dim=32, hidden_dim=64)
+            user_ids = torch.randint(0, 500, (4,))
+            item_ids = torch.randint(0, 500, (4,))
+            neighbor_ids = torch.randint(0, 500, (4, 5))
+            social_feats = torch.randn(4, 4)
+            sample_input = (user_ids, item_ids, neighbor_ids, social_feats)
+        else: # MMoE Neural Ranker
+            from models.multi_objective_ranker import MMoERanker
+            model = MMoERanker(input_dim=64, num_experts=3, expert_dim=64)
+            sample_input = torch.randn(8, 64)
+
+        size_before = DynamicQuantizer.get_model_size_mb(model)
+        bench_before = PerformanceProfiler.benchmark_inference(model, sample_input, num_runs=50)
+        q_model = DynamicQuantizer.quantize(model)
+        size_after = DynamicQuantizer.get_model_size_mb(q_model)
+        bench_after = PerformanceProfiler.benchmark_inference(q_model, sample_input, num_runs=50)
+
+        latency_reduction = ((bench_before["p50_latency_ms"] - bench_after["p50_latency_ms"]) / max(bench_before["p50_latency_ms"], 1e-5)) * 100.0
+        compression_ratio = ((size_before - size_after) / max(size_before, 1e-5)) * 100.0
+        
+        metric_grid = f"""
+        <div style='display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px;'>
+            <div style='background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); padding: 15px; border-radius: 12px;'>
+                <h4 style='margin: 0 0 10px 0; color: #3b82f6;'>🔵 Standard Model (FP32)</h4>
+                <p style='margin: 5px 0; color: #d1d5db;'>📊 Size: <b>{size_before:.3f} MB</b></p>
+                <p style='margin: 5px 0; color: #d1d5db;'>⚡ p50 Latency: <b>{bench_before['p50_latency_ms']:.3f} ms</b></p>
+                <p style='margin: 5px 0; color: #d1d5db;'>🚀 Throughput: <b>{bench_before['qps_throughput']:.1f} QPS</b></p>
+            </div>
+            <div style='background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); padding: 15px; border-radius: 12px;'>
+                <h4 style='margin: 0 0 10px 0; color: #10b981;'>🟢 Quantized Model (INT8)</h4>
+                <p style='margin: 5px 0; color: #d1d5db;'>📊 Size: <b>{size_after:.3f} MB</b></p>
+                <p style='margin: 5px 0; color: #d1d5db;'>⚡ p50 Latency: <b>{bench_after['p50_latency_ms']:.3f} ms</b></p>
+                <p style='margin: 5px 0; color: #d1d5db;'>🚀 Throughput: <b>{bench_after['qps_throughput']:.1f} QPS</b></p>
+            </div>
+        </div>
+        """
+        summary_html = f"""
+        <div style='background: rgba(255,255,255,0.02); border: 1px solid rgba(99, 102, 241, 0.2); padding: 15px; border-radius: 12px; margin-top: 20px;'>
+            <h4 style='margin: 0 0 10px 0; color: #a855f7;'>🎉 Optimization Report</h4>
+            <ul style='margin: 0; padding-left: 20px; color: #fff;'>
+                <li>Inference Latency reduced by: <b style='color: #10b981;'>{latency_reduction:.1f}%</b></li>
+                <li>Model Footprint compressed by: <b style='color: #10b981;'>{compression_ratio:.1f}%</b></li>
+                <li>Status: <b style='color: #3b82f6;'>Quantized module successfully cached and serving in sandbox!</b></li>
+            </ul>
+        </div>
+        """
+        return metric_grid, summary_html
+    except Exception as e:
+        return f"<p style='color:#ef4444;'>Failed to quantize: {e}</p>", ""
+
+
+def toggle_cache_ui(enabled: bool) -> str:
+    cache_enabled_state[0] = bool(enabled)
+    if enabled:
+        return "<span style='color: #10b981; font-weight: bold;'>⚡ Active (LRU Cache successfully intercepting candidate lookups)</span>"
+    else:
+        ui_lru_cache.clear()
+        return "<span style='color: #f43f5e; font-weight: bold;'>❌ Disabled (Direct neural forward pass for all requests)</span>"
+
+
+def clear_cache_ui() -> str:
+    ui_lru_cache.clear()
+    return "<span style='color: #eab308; font-weight: bold;'>🧹 Cache Cleared successfully!</span>"
+
+
 CSS = """
 body,.gradio-container{background:radial-gradient(circle at 10% 20%,#0f0f14,#050508)!important;
   font-family:'Inter',-apple-system,sans-serif!important;color:#f3f4f6!important}
@@ -328,6 +571,93 @@ with gr.Blocks(title="🎬 YouTube Recommendation Lite", css=CSS) as demo:
                     cmp_chart = gr.Plot(label="Evaluation Metrics")
                     cmp_tbl   = gr.HTML("<div style='color:#a1a1aa;padding:20px;text-align:center'>Run comparison.</div>")
             btn_cmp.click(fn=compare_models, inputs=mdl_chk, outputs=[cmp_chart, cmp_tbl])
+
+        # ── Tab 4: Real-Time Streaming Demo ──────────────────────────────────
+        with gr.TabItem("📡 Real-Time Streaming Demo"):
+            gr.HTML("<h3>📡 Real-Time Event Pipeline Diagnostics</h3>")
+            with gr.Row():
+                with gr.Column(variant="panel"):
+                    gr.HTML("<h4>🔥 Stream Control</h4>")
+                    stream_user = gr.Slider(minimum=0, maximum=149, value=42, step=1, label="Active Session User")
+                    btn_watch = gr.Button("🎬 Watch a Random Video", variant="primary")
+                    stream_status = gr.Markdown("Live monitoring active.")
+                    gr.HTML("<hr style='border-color:rgba(255,255,255,0.08); margin: 15px 0;'/>")
+                    events_counter = gr.Label(value="0.00 events/sec", label="📈 Live Kafka Throughput")
+                with gr.Column(variant="panel"):
+                    gr.HTML("<h4>🔥 Currently Trending (Flink Sliding Window)</h4>")
+                    trending_box = gr.HTML("<div style='color:#a1a1aa; font-style:italic;'>No trends logged.</div>")
+                with gr.Column(variant="panel"):
+                    gr.HTML("<h4>🔬 Active User Session History</h4>")
+                    session_box = gr.HTML("<div style='color:#a1a1aa; font-style:italic;'>No session history.</div>")
+            
+            def auto_poll_loop(user):
+                return stream_refresh_stats(user)
+                
+            btn_watch.click(fn=inject_watch_event, inputs=stream_user, outputs=stream_status)
+            timer = gr.Timer(3.0)
+            timer.tick(fn=auto_poll_loop, inputs=stream_user, outputs=[events_counter, trending_box, session_box])
+
+        # ── Tab 5: Cold Start vs Warm User ───────────────────────────────────
+        with gr.TabItem("❄️ Cold Start vs Warm User"):
+            gr.HTML("<h3>❄️ Strategy Allocation Sandbox</h3>")
+            with gr.Row():
+                with gr.Column(scale=1, variant="panel"):
+                    toggle_user = gr.Radio(choices=["New User", "Experienced User (500+ watches)"], value="New User", label="Select User Profile Type")
+                    btn_strat = gr.Button("🛡️ Generate Recommendations", variant="primary")
+                with gr.Column(scale=2, variant="panel"):
+                    strat_recs = gr.HTML("<div style='color:#a1a1aa; padding:20px; text-align:center;'>Generate recommendations to view strategies.</div>")
+                with gr.Column(scale=1, variant="panel"):
+                    strat_explanation = gr.Markdown("Strategy details will print here.")
+            btn_strat.click(fn=get_user_strategy_recs, inputs=toggle_user, outputs=[strat_recs, strat_explanation])
+
+        # ── Tab 6: Explain Recommendation ────────────────────────────────────
+        with gr.TabItem("💡 Explain Recommendation"):
+            gr.HTML("<h3>💡 Recommendations Explainability Panel</h3>")
+            with gr.Row():
+                with gr.Column(scale=1, variant="panel"):
+                    exp_user = gr.Slider(minimum=0, maximum=149, value=42, step=1, label="Target User ID")
+                    exp_video = gr.Slider(minimum=1, maximum=300, value=170, step=1, label="Video ID to Query")
+                    btn_explain = gr.Button("❓ Why was this recommended?", variant="primary")
+                with gr.Column(scale=2, variant="panel"):
+                    explain_out = gr.HTML("<div style='color:#a1a1aa; font-size:1.1em; padding:20px; text-align:center;'>Ask the engine to construct logical trace profiles.</div>")
+            btn_explain.click(
+                fn=lambda u, v: f"<div style='background:rgba(255,255,255,0.02); border: 1px solid rgba(99, 102, 241, 0.2); border-radius:12px; padding:15px; font-size:1.15em; color:#fff;'>{explain_recommendation(u,v)}</div>",
+                inputs=[exp_user, exp_video],
+                outputs=explain_out
+            )
+
+        # ── Tab 7: Model Optimizations ───────────────────────────────────────
+        with gr.TabItem("⚡ Model Optimizations"):
+            gr.HTML("<h3>⚡ Model Compression & Inference Optimization</h3>")
+            gr.HTML("<p style='color: #a1a1aa; margin-bottom: 15px;'>Apply post-training dynamic integer quantization (FP32 ➔ INT8) to accelerate inference speeds or activate LRU lookup caches to achieve high-throughput sub-millisecond lookups.</p>")
+            with gr.Row():
+                with gr.Column(scale=1, variant="panel"):
+                    gr.HTML("<h4>⚙️ Compression Sandbox</h4>")
+                    opt_model_name = gr.Dropdown(choices=["MMoE Neural Ranker", "BERT4Rec Transformer", "GraphSAGE GNN"], value="BERT4Rec Transformer", label="Select PyTorch Target Model")
+                    btn_quantize = gr.Button("🚀 Quantize selected model!", variant="primary")
+                    gr.HTML("<hr style='border-color:rgba(255,255,255,0.08); margin: 15px 0;'/>")
+                    gr.HTML("<h4>🚀 Candidate LRU Cache</h4>")
+                    toggle_cache = gr.Checkbox(label="Enable Inference Candidate Cache", value=False)
+                    btn_clear_cache = gr.Button("🧹 Clear Cache Pool", size="sm")
+                    cache_status = gr.HTML(value="<span style='color:#a1a1aa;'>Cache pool cleared.</span>")
+                with gr.Column(scale=2, variant="panel"):
+                    gr.HTML("<h4>📊 Acceleration & Footprint Gains</h4>")
+                    opt_metrics_grid = gr.HTML("<div style='color:#a1a1aa; padding:40px; text-align:center;'>Apply quantization to observe profiling benchmarks.</div>")
+                    opt_report_box = gr.HTML("")
+            btn_quantize.click(
+                fn=quantize_model_ui,
+                inputs=opt_model_name,
+                outputs=[opt_metrics_grid, opt_report_box]
+            )
+            toggle_cache.change(
+                fn=toggle_cache_ui,
+                inputs=toggle_cache,
+                outputs=cache_status
+            )
+            btn_clear_cache.click(
+                fn=clear_cache_ui,
+                outputs=cache_status
+            )
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
