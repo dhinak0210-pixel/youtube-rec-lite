@@ -177,7 +177,14 @@ function rs_close_{uid}(){{
 # ── Tab functions ─────────────────────────────────────────────────────────────
 def get_recs(user_id, top_n):
     try:
-        result = _engine.get_recommendations(int(user_id), top_n=int(top_n))
+        response = _engine.recommend(int(user_id), n=int(top_n))
+        if hasattr(response, "model_dump"):
+            result = response.model_dump()
+        elif hasattr(response, "dict"):
+            result = response.dict()
+        else:
+            result = response
+        
         recs   = result.get("recommendations", [])
         expl   = result.get("explanations", {})
         group  = result.get("group", "N/A")
