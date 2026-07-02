@@ -297,7 +297,7 @@ def stream_refresh_stats(user_id: int) -> Tuple[str, str, str]:
     try:
         total_clicks = 0
         if _sp:
-            total_clicks = len(_sp.event_queue.queue)
+            total_clicks = len(_sp.queue.queue)
         events_sec = total_clicks * 0.05 + random.uniform(1.2, 3.8)
             
         trending_list = []
@@ -346,7 +346,7 @@ def inject_watch_event(user_id: int) -> str:
         except Exception:
             pass
             
-        from src.streaming.event import StreamEvent
+        from src.streaming.simulator import StreamEvent
         stream_event = StreamEvent(
             user_id=int(user_id),
             item_id=vid,
