@@ -1,20 +1,8 @@
----
-title: YouTube Recommendation Lite
-emoji: 🎬
-colorFrom: red
-colorTo: purple
-sdk: gradio
-sdk_version: "4.44.0"
-python_version: "3.10"
-app_file: hf_app.py
-pinned: false
----
+"""
+Hugging Face Spaces entry-point – YouTube Recommendation Lite.
+Self-contained Gradio demo; trains all models inline at startup on a synthetic dataset.
+"""
 
-"""
-Hugging Face Spaces entry-point for YouTube Recommendation Lite.
-Runs a standalone, self-contained Gradio demo (no separate FastAPI process).
-All models are trained inline at startup on a small synthetic dataset.
-"""
 
 import sys, os, time, random, math
 sys.path.insert(0, ".")
