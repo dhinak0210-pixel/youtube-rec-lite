@@ -22,3 +22,4 @@ matplotlib>=3.7.0
 # Utilities
 tqdm>=4.65.0
 rich>=13.0.0
+loguru>=0.7.0
